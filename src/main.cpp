@@ -1,113 +1,194 @@
-#include "arduinoFFT.h"
+/*
+
 #include <Adafruit_CircuitPlayground.h>
+#include "arduinoFFT.h"
 
-/* ---------- tunables ---------- */
-const uint16_t   FFT_SAMPLES   = 512;      
-const float      SAMPLE_RATE_HZ = 100.0;   // 100 Hz → 3 s ≈ 300 samples → zero-pad to 512
-const float      MOVE_THRESH_G = 0.05;     // below this (≈ ±0.05 g) we think it's “not held”
-const uint16_t   HOLD_OFF_MS   = 3000;     // capture window ≈ 3 s
-const float      TREMOR_MIN_HZ = 3.0, TREMOR_MAX_HZ = 5.0;
-const float      DYSK_MIN_HZ   = 5.0, DYSK_MAX_HZ   = 7.0;
+#define FFT_SAMPLES 128
+#define SAMPLE_RATE_HZ 42.67
 
-/* ---------- globals ---------- */
-double vReal[512];
-double vImag[512];
+double vReal[FFT_SAMPLES];
+double vImag[FFT_SAMPLES];
 
 ArduinoFFT<double> FFT = ArduinoFFT<double>(vReal, vImag, FFT_SAMPLES, SAMPLE_RATE_HZ);
 
-uint16_t  sampleIndex   = 0;
-uint32_t  lastSampleMic = 0;
-bool      collecting    = false;
-bool      windowReady   = false;
-
-
-/* ---------- helper: g-force magnitude ---------- */
-float readAccelG()
-{
-  float ax = CircuitPlayground.motionX();
-  float ay = CircuitPlayground.motionY();
-  float az = CircuitPlayground.motionZ();
-
-  // magnitude, then convert to g
-  return sqrtf(ax * ax + ay * ay + az * az) / 9.80665f;
-}
-
-/* ---------- Arduino life-cycle ---------- */
-void setup()
-{
+void setup() {
+  Serial.begin(9600);
   CircuitPlayground.begin();
-  CircuitPlayground.setAccelRange(LIS3DH_RANGE_4_G);
-  CircuitPlayground.clearPixels();
-  
-  Serial.begin(115200); // Just for testing -- print out whether the motion is T or D
-  while(!Serial);
 }
 
-void loop()
-{
-  /* ------ 1. decide whether the board is being held  ------ */
-  float g = readAccelG();
-  static uint32_t lastMovement = 0;
-  if (fabs(g - 1.0) > MOVE_THRESH_G)               // ≠ gravity-only
-      lastMovement = millis();
-
-  bool held = (millis() - lastMovement < HOLD_OFF_MS);
-
-  /* ------ 2. start or stop capture ------ */
-  if (held && !collecting) {                 // new capture window
-      sampleIndex = 0;
-      collecting  = true;
-  }
-  if (!held && collecting) {                 // aborted because idle
-      collecting  = false;
+void loop() {
+  // 1. Collect acceleration magnitude
+  double sum = 0;
+  for (int i = 0; i < FFT_SAMPLES; i++) {
+    float ax = CircuitPlayground.motionX();
+    float ay = CircuitPlayground.motionY();
+    float az = CircuitPlayground.motionZ();
+    double mag = sqrt(ax * ax + ay * ay + az * az);
+    vReal[i] = mag;
+    vImag[i] = 0;
+    sum += mag;
+    delay(1000 * 3 / FFT_SAMPLES); // ~23ms
   }
 
-  /* ------ 3. timed sampling @ SAMPLE_RATE_HZ ------ */
-  if (collecting) {
-      uint32_t nowMic = micros();
-      if (nowMic - lastSampleMic >= (1e6 / SAMPLE_RATE_HZ)) {
-          lastSampleMic = nowMic;
-          vReal[sampleIndex] = (double)((g - 1.0) * 1000.0);  // convert to milli-g centred on 0
-          vImag[sampleIndex] = 0.0;
-          sampleIndex++;
-          if (sampleIndex >= FFT_SAMPLES) {      // buffer full
-              collecting  = false;
-              windowReady = true;
-          }
-      }
+  // 2. Remove DC offset
+  double mean = sum / FFT_SAMPLES;
+  for (int i = 0; i < FFT_SAMPLES; i++) {
+    vReal[i] -= mean;
   }
 
-  /* ------ 4. run FFT when a window is ready ------ */
-  if (windowReady) {
-      /* 4a. windowing & FFT */
-      FFT.windowing(FFT_WIN_TYP_HANN, FFT_FORWARD);
-      FFT.compute(FFT_FORWARD);
-      FFT.complexToMagnitude();
+  // 3. FFT
+  FFT.windowing(FFTWindow::Hamming, FFTDirection::Forward);
+  FFT.compute(FFTDirection::Forward);
+  FFT.complexToMagnitude();
 
-      /* 4b. energy in each band */
-      float tremorEnergy = 0.0, dyskEnergy = 0.0;
-      for (uint16_t i = 1; i < FFT_SAMPLES / 2; ++i) {     // Nyquist/2
-          float freq = (i * SAMPLE_RATE_HZ) / FFT_SAMPLES;
-          if (freq >= TREMOR_MIN_HZ && freq <= TREMOR_MAX_HZ)
-              tremorEnergy += vReal[i];
-          else if (freq >= DYSK_MIN_HZ && freq <= DYSK_MAX_HZ)
-              dyskEnergy += vReal[i];
-      }
+  // 4. Find dominant peak in 1–10Hz range
+  double maxMag = 0;
+  int maxIndex = -1;
+  int lowBin = (int)(1.0 * FFT_SAMPLES / SAMPLE_RATE_HZ);   // ≈3
+  int highBin = (int)(10.0 * FFT_SAMPLES / SAMPLE_RATE_HZ); // ≈30
 
-      /* 4c. classify (simple winner-takes-all) */
-      const float ENERGY_THRESH = 50.0;           // empirical, adjust!
-      if (tremorEnergy > ENERGY_THRESH || dyskEnergy > ENERGY_THRESH) {
-          if (tremorEnergy > dyskEnergy) {
-              /* ---- TODO: indicate Tremor detected ---- */
-              Serial.println("This is TREMOR");
-          } else {
-              /* ---- TODO: indicate Dyskinesia detected ---- */
-              Serial.println("This is DYSKINESIA");
-          }
-      } else {
-          /* below threshold → no disorder detected */
-      }
-
-      windowReady = false;                        // wait for next capture
+  for (int i = lowBin; i <= highBin; i++) {
+    if (vReal[i] > maxMag) {
+      maxMag = vReal[i];
+      maxIndex = i;
+    }
   }
+
+  // 5. Sanity check: is the signal strong enough?
+  if (maxMag < 5.0 || maxIndex == -1) {
+    Serial.println("Peak Freq: None → Output Code: 0");
+    delay(1000);
+    return;
+  }
+
+  double peakFrequency = (maxIndex * SAMPLE_RATE_HZ) / FFT_SAMPLES;
+
+  // 6. Categorize
+  int outputCode = 0;
+  if (peakFrequency < 3.0) {
+    outputCode = 0;
+  } else if (peakFrequency < 5.0) {
+    outputCode = 1;
+  } else if (peakFrequency < 7.0) {
+    outputCode = 2;
+  } else {
+    outputCode = 3;
+  }
+
+  Serial.print("Peak Freq: ");
+  Serial.print(peakFrequency);
+  Serial.print(" Hz → Output Code: ");
+  Serial.println(outputCode);
+
+  delay(1000);
+}
+*/
+#include <Adafruit_CircuitPlayground.h>
+#include "arduinoFFT.h"
+
+#define FFT_SAMPLES 128
+#define SAMPLE_RATE_HZ 42.67
+
+double vReal[FFT_SAMPLES];
+double vImag[FFT_SAMPLES];
+
+ArduinoFFT<double> FFT = ArduinoFFT<double>(vReal, vImag, FFT_SAMPLES, SAMPLE_RATE_HZ);
+
+// === CONFIG OPTIONS ===
+const bool USE_Z_AXIS_ONLY = true;
+const double ENERGY_THRESHOLD = 20.0;      // reject noise
+const double VARIANCE_THRESHOLD = 0.01;    // reject idle
+const double TREMOR_ENERGY_UPERLIMIT = 800; // empirical value, can be changed
+const double DYSK_ENERGY_UPERLIMIT = 10000; // empirical value, can be changed
+const double DOMINANCE_RATIO = 1.5;        // must dominate to classify
+
+void setup() {
+  Serial.begin(115200);  // Teleplot recommends >=115200
+  CircuitPlayground.begin();
+}
+
+void loop() {
+  // 1. Collect sensor data
+  for (int i = 0; i < FFT_SAMPLES; i++) {
+    double mag;
+    if (USE_Z_AXIS_ONLY) {
+      mag = CircuitPlayground.motionZ();
+    } else {
+      float ax = CircuitPlayground.motionX();
+      float ay = CircuitPlayground.motionY();
+      float az = CircuitPlayground.motionZ();
+      mag = sqrt(ax * ax + ay * ay + az * az);
+    }
+    vReal[i] = mag;
+    vImag[i] = 0;
+    delay(1000 * 3 / FFT_SAMPLES);  // ≈23ms
+  }
+
+  // 2. Remove DC offset
+  FFT.dcRemoval(vReal, FFT_SAMPLES);
+
+  // 3. Variance check
+  double variance = 0;
+  for (int i = 0; i < FFT_SAMPLES; i++) {
+    variance += vReal[i] * vReal[i];
+  }
+  variance /= FFT_SAMPLES;
+
+  if (variance < VARIANCE_THRESHOLD) {
+    Serial.println("output:0");  // No movement
+    Serial.println("tremorEnergy:0");
+    Serial.println("dyskinesiaEnergy:0");
+    Serial.println("totalEnergy:0");
+    delay(1000);
+    return;
+  }
+
+  // 4. FFT
+  FFT.windowing(FFTWindow::Hamming, FFTDirection::Forward);
+  FFT.compute(FFTDirection::Forward);
+  FFT.complexToMagnitude();
+
+  // 5. Energy computation
+  double band3_5Hz = 0;
+  double band5_7Hz = 0;
+  double totalEnergy = 0;
+
+  for (int i = 1; i < FFT_SAMPLES / 2; i++) {
+    double freq = (i * SAMPLE_RATE_HZ) / FFT_SAMPLES;
+    double power = vReal[i] * vReal[i];
+    totalEnergy += power;
+
+    if (freq >= 3.0 && freq < 5.0) {
+      band3_5Hz += power;
+    } else if (freq >= 5.0 && freq < 7.0) {
+      band5_7Hz += power;
+    }
+  }
+
+  // 6. Classification
+  int outputCode = 0;
+  bool tremor_within_limit = band5_7Hz < TREMOR_ENERGY_UPERLIMIT;
+  bool dysk_within_limit = band3_5Hz < DYSK_ENERGY_UPERLIMIT;
+
+  if (totalEnergy < ENERGY_THRESHOLD) {
+    outputCode = 0;  // no strong signal
+  } else if ((band5_7Hz > band3_5Hz * DOMINANCE_RATIO) && tremor_within_limit) {
+    outputCode = 1;  // Tremor (5–7 Hz dominates)
+  } else if ((band3_5Hz > band5_7Hz * DOMINANCE_RATIO) && dysk_within_limit) {
+    outputCode = 2;  // Dyskinesia (3–5 Hz dominates)
+  } else {
+    outputCode = 3; // Not defined movement
+  }
+
+  // 7. Teleplot-compatible serial output
+  Serial.print("tremorEnergy:");
+  Serial.println(band5_7Hz);
+  Serial.print("dyskinesiaEnergy:");
+  Serial.println(band3_5Hz);
+  Serial.print("totalEnergy:");
+  Serial.println(totalEnergy);
+  Serial.print("output:");
+  Serial.println(outputCode);
+
+  delay(1000);
 }
