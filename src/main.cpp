@@ -17,6 +17,21 @@ const double TREMOR_ENERGY_UPPERLIMIT = 800; // empirical value, can be changed
 const double DYSK_ENERGY_UPPERLIMIT = 10000; // empirical value, can be changed
 const double DOMINANCE_RATIO = 1.5;        // must dominate to classify
 
+// === FUNCTIONS ===
+// tremor: pitch sweeps 300-900 Hz based on intensity
+void playTremorSound(float intensity) {
+  intensity = constrain(intensity, 0.0, 1.0);
+  uint16_t freq = 300 + intensity*600;
+  CircuitPlayground.playTone(freq, 100);
+}
+
+// dyskinesia: pitch sweeps 800-1400 Hz based on intensity
+void playDyskinesiaSound(float intensity) {
+  intensity = constrain(intensity, 0.0, 1.0);
+  uint16_t freq = 800 + intensity*600;
+  CircuitPlayground.playTone(freq, 100);
+}
+
 void setup() {
   Serial.begin(115200);  // Teleplot recommends >=115200
   CircuitPlayground.begin();
@@ -82,24 +97,28 @@ void loop() {
 
   // 6. Classification
   int outputCode = 0;
-  bool tremor_within_limit = band5_7Hz < TREMOR_ENERGY_UPPERLIMIT;
-  bool dysk_within_limit = band3_5Hz < DYSK_ENERGY_UPPERLIMIT;
-
+  bool tremor_within_limit = band3_5Hz < TREMOR_ENERGY_UPPERLIMIT;
+  bool dysk_within_limit   = band5_7Hz < DYSK_ENERGY_UPPERLIMIT;
+  
   if (totalEnergy < ENERGY_THRESHOLD) {
     outputCode = 0;  // no strong signal
-  } else if ((band5_7Hz > band3_5Hz * DOMINANCE_RATIO) && tremor_within_limit) {
-    outputCode = 1;  // Tremor (5–7 Hz dominates)
-  } else if ((band3_5Hz > band5_7Hz * DOMINANCE_RATIO) && dysk_within_limit) {
-    outputCode = 2;  // Dyskinesia (3–5 Hz dominates)
+    CircuitPlayground.stopTone();
+  } else if ((band3_5Hz > band5_7Hz * DOMINANCE_RATIO) && tremor_within_limit) {
+    outputCode = 1;  // tremor (3–5 Hz dominates)
+    playTremorSound(band3_5Hz / TREMOR_ENERGY_UPPERLIMIT);
+  } else if ((band5_7Hz > band3_5Hz * DOMINANCE_RATIO) && dysk_within_limit) {
+    outputCode = 2;  // dyskinesia (5–7 Hz dominates)
+    playDyskinesiaSound(band5_7Hz / DYSK_ENERGY_UPPERLIMIT);
   } else {
-    outputCode = 3; // Not defined movement
+    outputCode = 3; // unknown movement
+    CircuitPlayground.stopTone();
   }
 
   // 7. Teleplot-compatible serial output
   Serial.print("tremorEnergy:");
-  Serial.println(band5_7Hz);
-  Serial.print("dyskinesiaEnergy:");
   Serial.println(band3_5Hz);
+  Serial.print("dyskinesiaEnergy:");
+  Serial.println(band5_7Hz);
   Serial.print("totalEnergy:");
   Serial.println(totalEnergy);
   Serial.print("output:");
