@@ -1,44 +1,44 @@
 #include <Adafruit_CircuitPlayground.h>
 #include "arduinoFFT.h"
 
+
 #define FFT_SAMPLES 128
 #define SAMPLE_RATE_HZ 42.67
+
 
 double vReal[FFT_SAMPLES];
 double vImag[FFT_SAMPLES];
 
+
 ArduinoFFT<double> FFT = ArduinoFFT<double>(vReal, vImag, FFT_SAMPLES, SAMPLE_RATE_HZ);
+
 
 // === CONFIG OPTIONS ===
 const bool USE_Z_AXIS_ONLY = true;
-const double ENERGY_THRESHOLD = 20.0;      // reject noise
-const double VARIANCE_THRESHOLD = 0.01;    // reject idle
-const double TREMOR_ENERGY_UPPERLIMIT = 800; // empirical value, can be changed
-const double DYSK_ENERGY_UPPERLIMIT = 10000; // empirical value, can be changed
-const double DOMINANCE_RATIO = 1.5;        // must dominate to classify
+const double ENERGY_THRESHOLD = 20.0;
+const double VARIANCE_THRESHOLD = 0.01;
+const double TREMOR_ENERGY_UPPERLIMIT = 800;
+const double DYSK_ENERGY_UPPERLIMIT = 10000;
+const double DOMINANCE_RATIO = 1.5;
 
-// === FUNCTIONS ===
-// tremor: pitch sweeps 300-900 Hz based on intensity
-void playTremorSound(float intensity) {
-  intensity = constrain(intensity, 0.0, 1.0);
-  uint16_t freq = 300 + intensity*600;
-  CircuitPlayground.playTone(freq, 100);
-}
 
-// dyskinesia: pitch sweeps 800-1400 Hz based on intensity
-void playDyskinesiaSound(float intensity) {
-  intensity = constrain(intensity, 0.0, 1.0);
-  uint16_t freq = 800 + intensity*600;
-  CircuitPlayground.playTone(freq, 100);
-}
+// === FUNCTION PROTOTYPES ===
+void indicateWithLED(int code, float totalEnergy);
+float mapEnergy(float value, float minE, float maxE);
+void playTremorSound(float intensity);
+void playDyskinesiaSound(float intensity);
 
 void setup() {
-  Serial.begin(115200);  // Teleplot recommends >=115200
+  Serial.begin(115200);
   CircuitPlayground.begin();
+  CircuitPlayground.strip.setBrightness(50);
+  CircuitPlayground.strip.clear();
+  CircuitPlayground.strip.show();
 }
 
+
 void loop() {
-  // 1. Collect sensor data
+  static bool tremorToneOn = false;
   for (int i = 0; i < FFT_SAMPLES; i++) {
     double mag;
     if (USE_Z_AXIS_ONLY) {
@@ -54,39 +54,49 @@ void loop() {
     delay(1000 * 3 / FFT_SAMPLES);  // ≈23ms
   }
 
-  // 2. Remove DC offset
+
+  // DC Offset removal
   FFT.dcRemoval(vReal, FFT_SAMPLES);
 
-  // 3. Variance check
+
+  // Variance check
   double variance = 0;
   for (int i = 0; i < FFT_SAMPLES; i++) {
     variance += vReal[i] * vReal[i];
   }
   variance /= FFT_SAMPLES;
 
+
   if (variance < VARIANCE_THRESHOLD) {
-    Serial.println("output:0");  // No movement
+    Serial.println("output:0");
     Serial.println("tremorEnergy:0");
     Serial.println("dyskinesiaEnergy:0");
     Serial.println("totalEnergy:0");
+    indicateWithLED(0, 0);  // Green, all on
+    noTone(5);
+    tremorToneOn = false;
     delay(1000);
     return;
   }
 
-  // 4. FFT
+
+  // FFT
   FFT.windowing(FFTWindow::Hamming, FFTDirection::Forward);
   FFT.compute(FFTDirection::Forward);
   FFT.complexToMagnitude();
 
-  // 5. Energy computation
+
+  // Energy computation
   double band3_5Hz = 0;
   double band5_7Hz = 0;
   double totalEnergy = 0;
+
 
   for (int i = 1; i < FFT_SAMPLES / 2; i++) {
     double freq = (i * SAMPLE_RATE_HZ) / FFT_SAMPLES;
     double power = vReal[i] * vReal[i];
     totalEnergy += power;
+
 
     if (freq >= 3.0 && freq < 5.0) {
       band3_5Hz += power;
@@ -95,34 +105,119 @@ void loop() {
     }
   }
 
-  // 6. Classification
+
+  // Classification
   int outputCode = 0;
-  bool tremor_within_limit = band3_5Hz < TREMOR_ENERGY_UPPERLIMIT;
-  bool dysk_within_limit   = band5_7Hz < DYSK_ENERGY_UPPERLIMIT;
-  
+  bool tremor_within_limit = band5_7Hz < TREMOR_ENERGY_UPPERLIMIT;
+  bool dysk_within_limit = band3_5Hz < DYSK_ENERGY_UPPERLIMIT;
+
+
   if (totalEnergy < ENERGY_THRESHOLD) {
-    outputCode = 0;  // no strong signal
-    CircuitPlayground.stopTone();
-  } else if ((band3_5Hz > band5_7Hz * DOMINANCE_RATIO) && tremor_within_limit) {
-    outputCode = 1;  // tremor (3–5 Hz dominates)
-    playTremorSound(band3_5Hz / TREMOR_ENERGY_UPPERLIMIT);
-  } else if ((band5_7Hz > band3_5Hz * DOMINANCE_RATIO) && dysk_within_limit) {
-    outputCode = 2;  // dyskinesia (5–7 Hz dominates)
-    playDyskinesiaSound(band5_7Hz / DYSK_ENERGY_UPPERLIMIT);
+    outputCode = 0; // GOOD
+    noTone(5);
+    tremorToneOn = false;
+  } else if ((band3_5Hz > band5_7Hz * DOMINANCE_RATIO) && dysk_within_limit) {
+    outputCode = 2; // DYSK
+    noTone(5);
+    tremorToneOn = false;
+    playDyskinesiaSound(mapEnergy(band3_5Hz, 100, 10000));
+  } else if ((band5_7Hz > band3_5Hz * DOMINANCE_RATIO) && tremor_within_limit) {
+    outputCode = 1; // TREMOR
+    if (!tremorToneOn) {
+      CircuitPlayground.playTone(1000, 0xFFFF); // play indefinitely
+      tremorToneOn = true;
+    }
   } else {
-    outputCode = 3; // unknown movement
-    CircuitPlayground.stopTone();
+    outputCode = 3; // GOOD
+    noTone(5);
+    tremorToneOn = false;
   }
 
-  // 7. Teleplot-compatible serial output
+
+  // Serial output
   Serial.print("tremorEnergy:");
-  Serial.println(band3_5Hz);
-  Serial.print("dyskinesiaEnergy:");
   Serial.println(band5_7Hz);
+  Serial.print("dyskinesiaEnergy:");
+  Serial.println(band3_5Hz);
   Serial.print("totalEnergy:");
   Serial.println(totalEnergy);
   Serial.print("output:");
   Serial.println(outputCode);
 
+
+  // LED output
+  indicateWithLED(outputCode, totalEnergy);
   delay(1000);
+}
+
+
+// === AUDIO CONTROL ===
+// tremor: constant beep
+// dyskinesia: beep frequency scales with intensity
+void playDyskinesiaSound(float intensity) {
+  intensity = constrain(intensity, 0.0, 1.0);
+  uint8_t beepsPerSec = 1 + intensity * 9; // 1 to 10
+  uint16_t beepFreq = 500;
+  uint16_t beepDuration = 60; // ms per beep
+  uint16_t interval = 1000 / beepsPerSec; // ms between beeps
+  uint32_t startTime = millis();
+  // play beeps for 1 second total
+  while (millis() - startTime < 1000) {
+    CircuitPlayground.playTone(beepFreq, beepDuration);
+    delay(interval - beepDuration > 0 ? interval - beepDuration : 0);
+  }
+}
+
+// === LED CONTROL ===
+void indicateWithLED(int code, float totalEnergy) {
+  uint32_t color;
+  float intensity = mapEnergy(totalEnergy, 100, 10000);  // Normalize to [0, 1]
+  int numPixels;
+
+
+  // Set color and pixel count logic
+  switch (code) {
+    case 0: // No movement
+    case 3: // Ambiguous
+      color = CircuitPlayground.strip.Color(0, 255, 0);  // Green
+      numPixels = 10;  // All on
+      break;
+
+
+    case 1: // Tremor
+      color = CircuitPlayground.strip.Color(255, 0, 0);  // Red
+      if (intensity < 0.5) {
+        numPixels = round(intensity * 10 / 2);  // 0–5 pixels
+      } else {
+        numPixels = round(intensity * 10);      // Up to 10
+      }
+      break;
+
+
+    case 2: // Dyskinesia
+      color = CircuitPlayground.strip.Color(255, 255, 0);  // Yellow
+      numPixels = round(intensity * 10);  // 0–10 pixels
+      break;
+
+
+    default:
+      color = CircuitPlayground.strip.Color(0, 0, 255);  // Blue fallback
+      numPixels = 0;
+      break;
+  }
+
+
+  // Light up NeoPixels
+  CircuitPlayground.strip.clear();
+  for (int i = 0; i < numPixels; i++) {
+    CircuitPlayground.strip.setPixelColor(i, color);
+  }
+  CircuitPlayground.strip.show();
+}
+
+
+// === ENERGY SCALING HELPER ===
+float mapEnergy(float value, float minE, float maxE) {
+  value = constrain(value, minE, maxE);
+  return (value - minE) / (maxE - minE);
 }
